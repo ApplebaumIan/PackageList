@@ -31,10 +31,11 @@ enum Constants {
 enum AppError: Error {
     case invalidURL(URL)
     case fetchTimeout(URL)
+    case manifestNotFound(URL)
     case networkingError(Error)
     case noData(URL)
-    case noProducts(URL)
     case notFound(URL)
+    case outputIdentical
     case packageDumpError(String)
     case packageDumpTimeout
     case packageListChanged
@@ -45,17 +46,19 @@ enum AppError: Error {
     var localizedDescription: String {
         switch self {
             case .invalidURL(let url):
-                return "invalid url: \(url.absoluteString)"
+                return "invalid url: \(url)"
             case .fetchTimeout(let url):
-                return "timeout while fetching url: \(url.absoluteString)"
+                return "timeout while fetching url: \(url)"
+            case .manifestNotFound(let url):
+                return "no package manifest found at url: \(url)"
             case .networkingError(let error):
                 return "networking error: \(error.localizedDescription)"
             case .noData(let url):
-                return "no data returned from url: \(url.absoluteString)"
-            case .noProducts(let url):
-                return "package has not products: \(url.absoluteString)"
+                return "no data returned from url: \(url)"
             case .notFound(let url):
-                return "url not found (404): \(url.absoluteString)"
+                return "url not found (404): \(url)"
+            case .outputIdentical:
+                return "resulting package.json is unchanged. This typically means the package is already in the index."
             case .packageDumpError(let msg):
                 return "package dump failed: \(msg)"
             case .packageDumpTimeout:
@@ -65,7 +68,7 @@ enum AppError: Error {
             case .packageMoved:
                 return "package moved"
             case let .rateLimitExceeded(url, limit):
-                return "rate limit of \(limit) exceeded while requesting url: \(url.absoluteString)"
+                return "rate limit of \(limit) exceeded while requesting url: \(url)"
             case .syntaxError(let msg):
                 return msg
         }
@@ -77,13 +80,8 @@ enum RunMode {
     case processPackageList
 }
 
-struct Product: Decodable {
-    let name: String
-}
-
 struct Package: Decodable {
     let name: String
-    let products: [Product]
 }
 
 // MARK: - Generic helpers
@@ -113,17 +111,17 @@ class RedirectFollower: NSObject, URLSessionDataDelegate {
 extension URL {
     func followingRedirects(timeout: TimeInterval = 30) -> URL? {
         let semaphore = DispatchSemaphore(value: 0)
-        
+
         let follower = RedirectFollower(initialURL: self)
         let session = URLSession(configuration: .default, delegate: follower, delegateQueue: nil)
-        
+
         let task = session.dataTask(with: self) { (_, response, error) in
             semaphore.signal()
         }
-        
+
         task.resume()
         _ = semaphore.wait(timeout: .now() + timeout)
-        
+
         return follower.lastURL
     }
 }
@@ -132,20 +130,20 @@ extension URL {
 
 func fetch(_ url: URL, timeout: Int = 10) throws -> Data {
     var request = URLRequest(url: url)
-    
+
     if let token = Constants.githubToken {
         request.addValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
     }
-    
+
     let semaphore = DispatchSemaphore(value: 0)
-    
+
     var payload: Data?
     var taskError: AppError?
-    
+
     let session = URLSession(configuration: .default)
     let task = session.dataTask(with: request) { (data, response, error) in
         let httpResponse = response as? HTTPURLResponse
-        
+
         if let limit = httpResponse?.value(forHTTPHeaderField: "X-RateLimit-Limit").flatMap(Int.init),
            let remaining = httpResponse?.value(forHTTPHeaderField: "X-RateLimit-Remaining").flatMap(Int.init),
            remaining == 0 {
@@ -155,13 +153,13 @@ func fetch(_ url: URL, timeout: Int = 10) throws -> Data {
         } else if let error = error {
             taskError = .networkingError(error)
         }
-        
+
         payload = data
         semaphore.signal()
     }
-    
+
     task.resume()
-    
+
     switch semaphore.wait(timeout: .now() + .seconds(timeout)) {
     case .timedOut:
         throw AppError.fetchTimeout(url)
@@ -188,8 +186,20 @@ extension String {
         return self
     }
 
+    func rtrim(_ characterSet: CharacterSet = .whitespacesAndNewlines) -> String {
+        String(
+            reversed()
+                .drop(while: { char in
+                    CharacterSet(charactersIn: String(char)).isSubset(of: characterSet)
+                })
+                .reversed()
+        )
+    }
+
     func normalized() -> String {
-        lowercased().addingGitExtension()
+        lowercased()
+            .rtrim(.init(charactersIn: "/"))
+            .addingGitExtension()
     }
 }
 
@@ -203,7 +213,10 @@ extension URL {
     }
 
     func normalized() -> String {
-        absoluteString.lowercased().addingGitExtension()
+        absoluteString
+            .lowercased()
+            .rtrim(.init(charactersIn: "/"))
+            .addingGitExtension()
     }
 }
 
@@ -248,13 +261,47 @@ func getDefaultBranch(owner: String, repository: String) throws -> String {
     return try JSONDecoder().decode(Repository.self, from: json).default_branch
 }
 
-func getManifestURL(_ url: URL) throws -> URL {
+struct RepoFile: Codable {
+    var type: String
+    var path: String
+}
+
+func parseOwnerRepo(from url: URL) -> (owner: String, repository: String) {
     let repository = (url.pathExtension.lowercased() == "git")
         ? url.deletingPathExtension().lastPathComponent
         : url.lastPathComponent
-    let owner = url.deletingLastPathComponent().lastPathComponent    
-    let defaultBranch = try getDefaultBranch(owner: owner, repository: repository)
-    return URL(string: "https://raw.githubusercontent.com/\(owner)/\(repository)/\(defaultBranch)/Package.swift")!
+    let owner = url.deletingLastPathComponent().lastPathComponent
+    return (owner, repository)
+}
+
+func listFilesInRepo(owner: String, repository: String, branch: String) throws -> [RepoFile] {
+    let apiURL = URL(string: "https://api.github.com/repos/\(owner)/\(repository)/git/trees/\(branch)")!
+    let json = try fetch(apiURL)
+    struct Response: Codable {
+        var tree: [RepoFile]
+    }
+    do {
+        return try JSONDecoder().decode(Response.self, from: json).tree
+    } catch {
+        print("failed to parse listFilesInRepo response:")
+        print(String(decoding: json, as: UTF8.self))
+        throw error
+    }
+}
+
+func getManifestURLs(_ url: URL) throws -> [URL] {
+    let (owner, repository) = parseOwnerRepo(from: url)
+    let branch = try getDefaultBranch(owner: owner, repository: repository)
+    let manifestFiles = try listFilesInRepo(owner: owner, repository: repository, branch: branch)
+      .filter { $0.type == "blob" }
+      .filter { $0.path.hasPrefix("Package") }
+      .filter { $0.path.hasSuffix(".swift") }
+      .map(\.path)
+      .sorted()
+    guard !manifestFiles.isEmpty else { throw AppError.manifestNotFound(url) }
+    return manifestFiles.map {
+        URL(string: "https://raw.githubusercontent.com/\(owner)/\(repository)/\(branch)/\($0)")!
+    }
 }
 
 func createTempDir() throws -> URL {
@@ -286,13 +333,13 @@ func runDumpPackage(at path: URL, timeout: TimeInterval = 20) throws -> Data {
     }
 
     let process = createDumpPackageProcess(at: path, standardOutput: stdoutPipe, standardError: stderrPipe)
-    
+
     DispatchQueue.main.asyncAfter(deadline: .now() + timeout) {
         if process.isRunning { process.terminate() }
     }
     try process.run()
     process.waitUntilExit()
-    
+
     switch process.terminationStatus {
         case 0:
             return stdout
@@ -304,24 +351,24 @@ func runDumpPackage(at path: URL, timeout: TimeInterval = 20) throws -> Data {
     }
 }
 
+@discardableResult
 func dumpPackage(url: URL) throws -> Package {
-    let manifestURL = try getManifestURL(url)
-    let manifest = try fetch(manifestURL)
-    
     let tempDir = try createTempDir()
-    let fileURL = tempDir.appendingPathComponent("Package.swift")
-    try manifest.write(to: fileURL)
+    
+    for manifestURL in try getManifestURLs(url) {
+        let manifest = try fetch(manifestURL)
+        let fileURL = tempDir.appendingPathComponent(manifestURL.lastPathComponent)
+        try manifest.write(to: fileURL)
+    }
 
     let json = try runDumpPackage(at: tempDir)
     return try JSONDecoder().decode(Package.self, from: json)
 }
 
 func verifyURL(_ url: URL) throws -> URL {
+    print("verifying", url)
     guard let resolvedURL = url.followingRedirects() else { throw AppError.invalidURL(url) }
-    let pkg = try dumpPackage(url: resolvedURL)
-    guard !pkg.products.isEmpty else {
-        throw AppError.noProducts(url)
-    }
+    try dumpPackage(url: resolvedURL)
     return resolvedURL
 }
 
@@ -386,13 +433,17 @@ func processPackageList() throws {
         let original = String(decoding: packageListData, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
         let new = String(decoding: newListData, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
         if original != new {
-            print("⚠️  Changes have been made to 'packages.json'. Your original version has been")
-            print("⚠️  copied to 'package.backup.json'. Please commit the updated file.")
-            let backupURL = packageListFileURL.deletingLastPathComponent()
-                .appendingPathComponent("packages.backup.json")
-            try packageListData.write(to: backupURL)
-            try newListData.write(to: packageListFileURL)
-            throw AppError.packageListChanged
+            if newList == onlinePackageList.map(\.absoluteString) {
+                throw AppError.outputIdentical
+            } else {
+                print("⚠️  Changes have been made to 'packages.json'. Your original version has been")
+                print("⚠️  copied to 'package.backup.json'. Please commit the updated file.")
+                let backupURL = packageListFileURL.deletingLastPathComponent()
+                    .appendingPathComponent("packages.backup.json")
+                try packageListData.write(to: backupURL)
+                try newListData.write(to: packageListFileURL)
+                throw AppError.packageListChanged
+            }
         }
     }
 }
@@ -423,8 +474,21 @@ do {
 } catch {
     if let appError = error as? AppError {
         print("ERROR: \(appError.localizedDescription)")
+
+        if ProcessInfo.processInfo.environment["CI"] == "true" {
+            print("::set-output name=validateError::\(appError.localizedDescription)")
+
+            if case .packageListChanged = appError {
+                // For CI it's acceptable for the package list to change as we'll simply take the output of this script
+                exit(EXIT_SUCCESS)
+            }
+        }
     } else {
-        print(error)
+        if ProcessInfo.processInfo.environment["CI"] == "true" {
+            print("::set-output name=validateError::\(error)")
+        }
+
+        print("ERROR: \(error)")
     }
     exit(EXIT_FAILURE)
 }

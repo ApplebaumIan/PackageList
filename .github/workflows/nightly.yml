@@ -3,46 +3,117 @@ name: Nightly Audit
 on: 
   workflow_dispatch:
   schedule:
-    - cron: '0 2 * * *'
+    - cron: '0 6 * * *'
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  SPI_API_TOKEN: ${{ secrets.SPI_API_TOKEN }}
 
 jobs:
-  run_nightly:
-    runs-on: macos-latest
+
+  build_validator:
+    runs-on: ubuntu-latest
+    container:
+      image: swift:6.0.1-jammy
     steps:
-    - name: Checkout
-      uses: actions/checkout@v2
+      - name: Build validator
+        run: |
+          git clone https://github.com/SwiftPackageIndex/PackageList-Validator.git --depth 1
+          cd PackageList-Validator
+          swift build
+          cp $(swift build --show-bin-path)/validator $GITHUB_WORKSPACE/
 
-    - name: Run checks
-      env:
-        DEVELOPER_DIR: /Applications/Xcode_12.5.app
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: |
-        rm -f ./validator
-        curl -s -O "https://raw.githubusercontent.com/SwiftPackageIndex/PackageList-Validator/main/validator"
-        chmod +x ./validator
-        ./validator --version
-        ./validator check-redirects -i packages.json -o packages.json
-        echo
-        echo packages.json diff:
-        git diff packages.json
-        echo
-        ./validator check-dependencies -i packages.json -o packages.json
-        rm validator  # prevent binary from appearing in the PR
+      - name: Upload validator
+        uses: actions/upload-artifact@v4
+        with:
+          name: validator
+          path: validator
 
-    - name: Create Pull Request
-      id: cpr
-      uses: peter-evans/create-pull-request@v3
-      with:
-        token: ${{ secrets.GITHUB_TOKEN }}
-        commit-message: Updated Packages
-        title: '[Nightly] Updated Packages'
-        body: |
-          :robot: This is an automated change
-          
-          - Removed any redirects
-          - Removed any duplicates
-          - Removed any deleted repositories
-          - Added any unknown dependencies
 
-    - name: Check outputs
-      run: echo "Pull Request Number - ${{ steps.cpr.outputs.pull-request-number }}"
+  check_redirects:
+    needs: build_validator
+    env:
+      CONCURRENCY: "10"
+    runs-on: ubuntu-latest
+    container:
+      image: swift:6.0.1-jammy
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Download validator
+        uses: actions/download-artifact@v4
+        with:
+          name: validator
+
+      - name: Check redirect
+        uses: nick-fields/retry@v2
+        with:
+          timeout_minutes: 60
+          max_attempts: 1
+          retry_on: error
+          command: |
+            chmod +x ./validator
+            ./validator check-redirects -i packages.json -o redirect-checked.json --concurrency $CONCURRENCY
+            echo "diff packages.json redirect-checked.json"
+            diff packages.json redirect-checked.json || true
+
+      - name: Upload redirect-checked.json
+        uses: actions/upload-artifact@v4
+        with:
+          name: redirect-checked.json
+          path: redirect-checked.json
+
+
+  check_dependencies:
+    needs: check_redirects
+    runs-on: ubuntu-latest
+    container:
+      image: swift:6.0.1-jammy
+    steps:
+      # we need to check out the repo in the last step in order to create a PR
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Download validator
+        uses: actions/download-artifact@v4
+        with:
+          name: validator
+
+      - name: Download redirect-checked.json
+        uses: actions/download-artifact@v4
+        with:
+          name: redirect-checked.json
+
+      - name: Check dependencies
+        uses: nick-fields/retry@v2
+        with:
+          timeout_minutes: 60
+          max_attempts: 1
+          retry_on: error
+          command: |
+            chmod +x ./validator
+            ./validator check-dependencies \
+                --spi-api-token $SPI_API_TOKEN \
+                --input redirect-checked.json --output packages.json \
+                --limit 20
+            ./validator apply-deny-list -p packages.json -d denylist.json
+            # Stop artifacts from appearing in the PR
+            rm -f redirect-checked.json validator
+      - name: Create pull request
+        id: cpr
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: Updated Packages
+          title: '[Nightly] Updated Packages'
+          body: |
+            :robot: This is an automated change
+            
+            - Removed any redirects
+            - Removed any duplicates
+            - Removed any deleted repositories
+            - Added any unknown dependencies
+
+      - name: Check outputs
+        run: echo "Pull Request Number - ${{ steps.cpr.outputs.pull-request-number }}"

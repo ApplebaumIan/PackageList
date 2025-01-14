@@ -5,17 +5,19 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  pull_request_review:
+    types: [submitted]
 
 env:
-  SWIFT_IMAGE: swiftlang/swift@sha256:a0d75888a49938175bb4da3a3d6e3ab5cdf3095fe71ed427ee4a03a05a78336d  # swift 5.5 nightly
+  SWIFT_IMAGE: swift:6.0.1-jammy
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
   validate:
     runs-on: ubuntu-20.04
     steps:
-    - name: Checkout
-      uses: actions/checkout@v2
-    - name: Validate JSON
-      run: docker run --rm -v "$PWD:/host" -w /host $SWIFT_IMAGE swift validate.swift
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Validate JSON
+        run: docker run --rm --env GITHUB_TOKEN=$GITHUB_TOKEN -v "$PWD:/host" -w /host $SWIFT_IMAGE swift validate.swift
